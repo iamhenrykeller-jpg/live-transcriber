@@ -54,7 +54,7 @@
 const WEBAPP_URL = "https://script.google.com/macros/s/AKfycbzG8jkvaUiGHIYKUjl5jsi0r2fO0Yenj5QPvdmi0y_DiMGJSWZe2JQLxoXtOZU21NF5Jw/exec";
 /* ======================================================================= */
 
-let player, startedAt=0, mediaStream=null, recorder=null, lines=[];
+let player, startedAt=0, mediaStream=null, recorder=null;
 
 function onYouTubeIframeAPIReady(){
   player = new YT.Player('player', { height:'390', width:'640', videoId:'', playerVars:{ autoplay:0, playsinline:1, modestbranding:1 }});
@@ -94,16 +94,46 @@ function setStatus(msg, live=false){
   console.log('[status]', msg);
 }
 
+// --- patched Start/Stop handlers ---
 document.getElementById('start').onclick = async () => {
   try{
-    // 1) Ask user to share tab/window with audio
-    mediaStream = await navigator.mediaDevices.getDisplayMedia({ audio: true, video: false });
-    const track = mediaStream.getAudioTracks()[0];
-    if (!track) { alert('No audio track captured. Pick the tab with sound and check “Share audio”.'); return; }
+    if (location.protocol !== 'https:' && location.hostname !== 'localhost') {
+      console.warn('getDisplayMedia usually requires HTTPS. Use GitHub Pages or localhost.');
+    }
 
-    // 2) Record and ship small chunks to Apps Script → Whisper
-    const mime = MediaRecorder.isTypeSupported('audio/webm;codecs=opus') ? 'audio/webm;codecs=opus' : 'audio/webm';
-    recorder = new MediaRecorder(mediaStream, { mimeType: mime, audioBitsPerSecond: 128000 });
+    // Ask for VIDEO + AUDIO; audio-only often throws NotSupportedError
+    const constraints = {
+      video: true,
+      audio: {
+        echoCancellation: false,
+        noiseSuppression: false,
+        autoGainControl: false
+      }
+    };
+    mediaStream = await navigator.mediaDevices.getDisplayMedia(constraints);
+
+    // Immediately stop the video track; we only need audio
+    const vtrack = mediaStream.getVideoTracks()[0];
+    if (vtrack) vtrack.stop();
+
+    const atrack = mediaStream.getAudioTracks()[0];
+    if (!atrack) {
+      alert('No audio track captured. Pick the tab with sound and check “Share tab audio”.');
+      return;
+    }
+
+    // Recorder with robust mime fallback
+    let mime = '';
+    if (MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) {
+      mime = 'audio/webm;codecs=opus';
+    } else if (MediaRecorder.isTypeSupported('audio/webm')) {
+      mime = 'audio/webm';
+    } else if (MediaRecorder.isTypeSupported('audio/ogg;codecs=opus')) {
+      mime = 'audio/ogg;codecs=opus';
+    } // else leave mime empty and let browser choose
+
+    recorder = mime ? new MediaRecorder(mediaStream, { mimeType: mime, audioBitsPerSecond: 128000 })
+                    : new MediaRecorder(mediaStream);
 
     startedAt = Date.now();
     setStatus('listening…', true);
@@ -114,9 +144,13 @@ document.getElementById('start').onclick = async () => {
       await sendChunk(ev.data, offsetMs);
     };
 
-    recorder.start(5000); // 5s chunks; lower to 3000 for faster updates
+    recorder.start(5000); // 5s chunks
   }catch(err){
-    setStatus('error: ' + (err?.message || err), false);
+    // Common causes:
+    // - Picked a window/screen without system audio
+    // - Didn’t check “Share tab audio”
+    // - Unsupported browser (Safari/iOS)
+    setStatus('error: ' + (err?.message || String(err)), false);
   }
 };
 
