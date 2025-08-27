@@ -94,7 +94,7 @@ function setStatus(msg, live=false){
   console.log('[status]', msg);
 }
 
-// --- patched Start/Stop handlers ---
+// --- patched Start/Stop handlers (video+audio capture) ---
 document.getElementById('start').onclick = async () => {
   try{
     if (location.protocol !== 'https:' && location.hostname !== 'localhost') {
@@ -130,7 +130,7 @@ document.getElementById('start').onclick = async () => {
       mime = 'audio/webm';
     } else if (MediaRecorder.isTypeSupported('audio/ogg;codecs=opus')) {
       mime = 'audio/ogg;codecs=opus';
-    } // else leave mime empty and let browser choose
+    } // else let browser choose
 
     recorder = mime ? new MediaRecorder(mediaStream, { mimeType: mime, audioBitsPerSecond: 128000 })
                     : new MediaRecorder(mediaStream);
@@ -141,15 +141,11 @@ document.getElementById('start').onclick = async () => {
     recorder.ondataavailable = async ev => {
       if (!ev.data || ev.data.size === 0) return;
       const offsetMs = Date.now() - startedAt;
-      await sendChunk(ev.data, offsetMs);
+      await sendChunk(ev.data, offsetMs); // base64 JSON upload
     };
 
     recorder.start(5000); // 5s chunks
   }catch(err){
-    // Common causes:
-    // - Picked a window/screen without system audio
-    // - Didn’t check “Share tab audio”
-    // - Unsupported browser (Safari/iOS)
     setStatus('error: ' + (err?.message || String(err)), false);
   }
 };
@@ -160,12 +156,33 @@ document.getElementById('stop').onclick = () => {
   setStatus('stopped', false);
 };
 
+// ---- base64 JSON upload (Apps Script-friendly) ----
+async function blobToBase64(blob) {
+  const buf = await blob.arrayBuffer();
+  let binary = '';
+  const bytes = new Uint8Array(buf);
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
+  }
+  return btoa(binary);
+}
+
 async function sendChunk(blob, offsetMs){
   try{
-    const fd = new FormData();
-    fd.append('audio', blob, 'chunk.webm'); // Apps Script sees this as e.files.audio
+    const audioBase64 = await blobToBase64(blob);
+    const payload = {
+      audioBase64,
+      mime: blob.type || 'audio/webm'
+      // offsetMs // optional
+    };
 
-    const r = await fetch(WEBAPP_URL, { method: 'POST', body: fd });
+    const r = await fetch(WEBAPP_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+
     const data = await r.json();
 
     if (data && data.ok && data.text) {
@@ -178,6 +195,7 @@ async function sendChunk(blob, offsetMs){
     }
   } catch (e) {
     console.error('sendChunk failed', e);
+    setStatus('send failed: ' + (e?.message || String(e)), false);
   }
 }
 
