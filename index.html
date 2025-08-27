@@ -1,17 +1,16 @@
 <!doctype html>
 <html>
 <head>
-  <meta charset="utf-8">
-  <title>Live Transcriber - Local (Mic Picker)</title>
+  <meta charset="utf-8" />
+  <title>Live Transcriber — Whisper via Apps Script</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <style>
     :root { --gap:12px; --border:#e5e7eb; }
-    *{ box-sizing: border-box; }
-    body{ margin:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; }
+    *{ box-sizing:border-box }
+    body{ margin:0; font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif; }
     header{ display:flex; gap:var(--gap); align-items:center; padding:var(--gap); border-bottom:1px solid var(--border); flex-wrap:wrap; }
-    header input[type=text]{ flex:1 1 320px; padding:8px 10px; border:1px solid var(--border); border-radius:10px; }
+    header input{ flex:1 1 320px; padding:8px 10px; border:1px solid var(--border); border-radius:10px; }
     header button{ padding:8px 12px; border:1px solid var(--border); background:#111; color:#fff; border-radius:10px; cursor:pointer; }
-    header select{ padding:8px 10px; border:1px solid var(--border); border-radius:10px; background:#fff; }
     main{ display:grid; grid-template-columns: 1.2fr 1fr; min-height: calc(100vh - 60px); }
     #player-wrap{ padding:var(--gap); }
     #player{ width:100%; max-width:960px; aspect-ratio:16/9; background:#000; }
@@ -22,7 +21,6 @@
     .status-dot{ display:inline-block; width:10px; height:10px; border-radius:50%; background:#9ca3af; margin-right:6px; vertical-align:middle; }
     .status-dot.live{ background:#10b981; }
     .toolbar{ display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
-    #vu{ background:#f3f4f6; border-radius:8px; }
   </style>
   <script src="https://www.youtube.com/iframe_api"></script>
 </head>
@@ -32,219 +30,140 @@
     <button id="load">Load</button>
 
     <div class="toolbar">
-      <button id="start">Start</button>
+      <button id="start">Start (pick tab/window)</button>
       <button id="stop">Stop</button>
       <button id="exportTxt">Export .txt</button>
       <button id="exportJson">Export .json</button>
     </div>
 
-    <div class="toolbar">
-      <select id="micSelect" title="Pick input for the VU meter"></select>
-      <button id="perm" title="Request mic permission / refresh devices">Mic Permission</button>
-      <canvas id="vu" width="140" height="16" title="Live input level"></canvas>
-    </div>
-
-    <span class="meta">
-      <span id="liveDot" class="status-dot"></span><span id="status">idle</span>
-    </span>
-  </header> 
+    <span class="meta"><span id="dot" class="status-dot"></span><span id="status">idle</span></span>
+  </header>
 
   <main>
     <section id="player-wrap">
       <div id="player"></div>
       <div class="meta" style="padding:8px 0">
-        Tip: For best results, use a loopback input (Windows: “Stereo Mix”/VB-Cable; macOS: BlackHole/Loopback).
-        After you see the VU move, click the lock icon in Chrome → Microphone → select the same device for this page.
+        Click <b>Start</b>, choose the tab/window that’s playing the livestream, and check “Share audio”. No drivers or sound settings needed.
       </div>
     </section>
     <aside id="transcript"></aside>
   </main>
 
-  <script>
-    let player, rec, recognizing=false, startedAt=0, lines=[];
-    let micStream = null, vuRAF = null;
+<script>
+/* ====== SET THIS TO YOUR APPS SCRIPT WEB APP URL (ends with /exec) ====== */
+const WEBAPP_URL = "https://script.google.com/macros/s/AKfycbzG8jkvaUiGHIYKUjl5jsi0r2fO0Yenj5QPvdmi0y_DiMGJSWZe2JQLxoXtOZU21NF5Jw/exec";
+/* ======================================================================= */
 
-    // ---------- YouTube ----------
-    function onYouTubeIframeAPIReady(){
-      player = new YT.Player('player', {
-        height:'390', width:'640', videoId:'',
-        playerVars:{ autoplay:0, playsinline:1, modestbranding:1 },
-        events:{
-          onReady:(e)=>{
-            // quiet the widget warnings
-            e.target.getIframe()?.setAttribute(
-              'allow',
-              'autoplay; encrypted-media; picture-in-picture; clipboard-write; web-share; accelerometer; gyroscope'
-            );
-          }
-        }
-      });
-    }
-    function parseYouTubeId(url){
-      if (!url) return '';
-      let m = url.match(/[?&]v=([A-Za-z0-9_-]{6,})/); if (m) return m[1];
-      m = url.match(/youtu\.be\/([A-Za-z0-9_-]{6,})/); if (m) return m[1];
-      m = url.match(/youtube\.com\/live\/([A-Za-z0-9_-]{6,})/); if (m) return m[1];
-      m = url.match(/youtube\.com\/embed\/([A-Za-z0-9_-]{6,})/); if (m) return m[1];
-      return '';
-    }
-    document.getElementById('load').onclick = () => {
-      const url = document.getElementById('ytUrl').value.trim();
-      const id = parseYouTubeId(url);
-      if (id) { player.loadVideoById(id); logStatus('video loaded'); }
-      else { logStatus('could not parse video id'); }
+let player, startedAt=0, mediaStream=null, recorder=null, lines=[];
+
+function onYouTubeIframeAPIReady(){
+  player = new YT.Player('player', { height:'390', width:'640', videoId:'', playerVars:{ autoplay:0, playsinline:1, modestbranding:1 }});
+}
+function parseYouTubeId(url){
+  if (!url) return '';
+  let m = url.match(/[?&]v=([A-Za-z0-9_-]{6,})/); if (m) return m[1];
+  m = url.match(/youtu\.be\/([A-Za-z0-9_-]{6,})/); if (m) return m[1];
+  m = url.match(/youtube\.com\/live\/([A-Za-z0-9_-]{6,})/); if (m) return m[1];
+  m = url.match(/youtube\.com\/embed\/([A-Za-z0-9_-]{6,})/); if (m) return m[1];
+  return '';
+}
+document.getElementById('load').onclick = () => {
+  const url = document.getElementById('ytUrl').value.trim();
+  const id = parseYouTubeId(url);
+  if (id) player.loadVideoById(id);
+};
+
+function secToClock(sec){
+  sec = Math.max(0, Math.floor(sec));
+  const h = Math.floor(sec/3600), m = Math.floor((sec%3600)/60), s = sec%60;
+  return (h? String(h).padStart(2,'0')+':' : '') + String(m).padStart(2,'0') + ':' + String(s).padStart(2,'0');
+}
+function addLine(text, startSec){
+  const div = document.createElement('div'); div.className = 'line';
+  const a = document.createElement('span'); a.className = 'ts';
+  a.textContent = '[' + secToClock(startSec) + ']';
+  a.onclick = () => player?.seekTo && player.seekTo(startSec, true);
+  const t = document.createElement('span'); t.textContent = ' ' + text;
+  div.appendChild(a); div.appendChild(t);
+  const pane = document.getElementById('transcript');
+  pane.appendChild(div); pane.scrollTop = pane.scrollHeight;
+}
+function setStatus(msg, live=false){
+  document.getElementById('status').textContent = msg;
+  document.getElementById('dot').classList.toggle('live', !!live);
+  console.log('[status]', msg);
+}
+
+document.getElementById('start').onclick = async () => {
+  try{
+    // 1) Ask user to share tab/window with audio
+    mediaStream = await navigator.mediaDevices.getDisplayMedia({ audio: true, video: false });
+    const track = mediaStream.getAudioTracks()[0];
+    if (!track) { alert('No audio track captured. Pick the tab with sound and check “Share audio”.'); return; }
+
+    // 2) Record and ship small chunks to Apps Script → Whisper
+    const mime = MediaRecorder.isTypeSupported('audio/webm;codecs=opus') ? 'audio/webm;codecs=opus' : 'audio/webm';
+    recorder = new MediaRecorder(mediaStream, { mimeType: mime, audioBitsPerSecond: 128000 });
+
+    startedAt = Date.now();
+    setStatus('listening…', true);
+
+    recorder.ondataavailable = async ev => {
+      if (!ev.data || ev.data.size === 0) return;
+      const offsetMs = Date.now() - startedAt;
+      await sendChunk(ev.data, offsetMs);
     };
 
-    // ---------- Utils ----------
-    function secToClock(sec){
-      sec = Math.max(0, Math.floor(sec));
-      const h = Math.floor(sec/3600), m = Math.floor((sec%3600)/60), s = sec%60;
-      return (h? String(h).padStart(2,'0')+':' : '') + String(m).padStart(2,'0') + ':' + String(s).padStart(2,'0');
+    recorder.start(5000); // 5s chunks; lower to 3000 for faster updates
+  }catch(err){
+    setStatus('error: ' + (err?.message || err), false);
+  }
+};
+
+document.getElementById('stop').onclick = () => {
+  try { recorder?.stop(); } catch {}
+  try { mediaStream?.getTracks().forEach(t => t.stop()); } catch {}
+  setStatus('stopped', false);
+};
+
+async function sendChunk(blob, offsetMs){
+  try{
+    const fd = new FormData();
+    fd.append('audio', blob, 'chunk.webm'); // Apps Script sees this as e.files.audio
+
+    const r = await fetch(WEBAPP_URL, { method: 'POST', body: fd });
+    const data = await r.json();
+
+    if (data && data.ok && data.text) {
+      const text = data.text.trim();
+      const secs = Math.floor(offsetMs/1000);
+      addLine(text, Math.max(0, secs - 2));
+    } else if (data?.error) {
+      console.warn('Whisper error', data);
+      setStatus('Whisper error (see console)', false);
     }
-    function addLine(text, startSec){
-      const div = document.createElement('div');
-      div.className = 'line';
-      const a = document.createElement('span');
-      a.className = 'ts';
-      a.textContent = '[' + secToClock(startSec) + ']';
-      a.onclick = () => player?.seekTo && player.seekTo(startSec, true);
-      const t = document.createElement('span');
-      t.textContent = ' ' + text;
-      div.appendChild(a); div.appendChild(t);
-      const pane = document.getElementById('transcript');
-      pane.appendChild(div); pane.scrollTop = pane.scrollHeight;
-    }
-    function logStatus(msg, live=false){
-      document.getElementById('status').textContent = msg;
-      document.getElementById('liveDot').classList.toggle('live', !!live);
-      console.log('[status]', msg);
-    }
+  } catch (e) {
+    console.error('sendChunk failed', e);
+  }
+}
 
-    // ---------- Web Speech Recognition ----------
-    function getRecognizer(){
-      const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-      if (!SR) { alert('Web Speech API not supported or blocked. Use Chrome over https (Sites/GitHub Pages), then try again.'); return null; }
-      const r = new SR();
-      r.lang = 'en-US';
-      r.interimResults = true;
-      r.continuous = true;
-      return r;
-    }
-
-    document.getElementById('start').onclick = () => {
-      if (recognizing) return;
-      const SR = getRecognizer(); if (!SR) return;
-      rec = SR; lines = []; document.getElementById('transcript').innerHTML = '';
-      startedAt = Date.now(); logStatus('listening…', true);
-
-      rec.onresult = (e) => {
-        let finalChunk='';
-        for (let i=e.resultIndex; i<e.results.length; i++){
-          const res = e.results[i];
-          if (res.isFinal) finalChunk += res[0].transcript.trim() + ' ';
-        }
-        if (finalChunk){
-          const secs = Math.floor((Date.now()-startedAt)/1000);
-          const line = { text: finalChunk.trim(), startSec: Math.max(0, secs-2) };
-          lines.push(line); addLine(line.text, line.startSec);
-        }
-      };
-      rec.onerror = (e) => {
-        console.warn('rec error', e);
-        if (e?.error === 'no-speech') logStatus('no speech detected — check mic input / use https', false);
-      };
-      rec.onend = () => { recognizing=false; logStatus('stopped', false); };
-      try { rec.start(); } catch(_) {}
-      recognizing = true;
-    };
-
-    document.getElementById('stop').onclick = () => {
-      try { rec?.stop(); } catch(_) {}
-    };
-
-    // ---------- Export ----------
-    document.getElementById('exportTxt').onclick = () => {
-      const txt = lines.map(l => '['+secToClock(l.startSec)+'] '+l.text).join('\n');
-      const blob = new Blob([txt], {type:'text/plain'});
-      const a = document.createElement('a'); a.href = URL.createObjectURL(blob);
-      a.download = 'transcript.txt'; a.click(); URL.revokeObjectURL(a.href);
-    };
-    document.getElementById('exportJson').onclick = () => {
-      const blob = new Blob([JSON.stringify({ lines }, null, 2)], {type:'application/json'});
-      const a = document.createElement('a'); a.href = URL.createObjectURL(blob);
-      a.download = 'transcript.json'; a.click(); URL.revokeObjectURL(a.href);
-    };
-
-    // ---------- Mic Picker + VU Meter ----------
-    async function refreshDevices(){
-      const devices = await navigator.mediaDevices.enumerateDevices();
-      const mics = devices.filter(d => d.kind === 'audioinput');
-      const sel = document.getElementById('micSelect');
-      sel.innerHTML = '';
-      mics.forEach((d, idx) => {
-        const opt = document.createElement('option');
-        opt.value = d.deviceId;
-        opt.textContent = d.label || `Mic ${idx+1}`;
-        sel.appendChild(opt);
-      });
-    }
-
-    async function startMicMonitor(){
-      try{
-        if (micStream) micStream.getTracks().forEach(t => t.stop());
-        const deviceId = document.getElementById('micSelect').value || undefined;
-        micStream = await navigator.mediaDevices.getUserMedia({
-          audio: deviceId ? { deviceId: { exact: deviceId } } : true
-        });
-
-        const ctx = new (window.AudioContext || window.webkitAudioContext)();
-        const source = ctx.createMediaStreamSource(micStream);
-        const analyser = ctx.createAnalyser();
-        analyser.fftSize = 2048;
-        source.connect(analyser);
-
-        const vu = document.getElementById('vu');
-        const g = vu.getContext('2d');
-        const data = new Uint8Array(analyser.fftSize);
-
-        function draw(){
-          analyser.getByteTimeDomainData(data);
-          let peak = 0;
-          for (let i=0;i<data.length;i++){
-            const v = Math.abs(data[i]-128);
-            if (v>peak) peak=v;
-          }
-          const norm = Math.min(1, peak/64); // rough scale
-          g.clearRect(0,0,vu.width,vu.height);
-          g.fillStyle = '#111';
-          g.fillRect(0,0,vu.width*norm,vu.height);
-          vuRAF = requestAnimationFrame(draw);
-        }
-        if (vuRAF) cancelAnimationFrame(vuRAF);
-        draw();
-        logStatus('mic monitoring', true);
-      }catch(err){
-        alert('Mic access failed: ' + err.message + '\nIf this is a file:// page, Chrome may restrict mic. Host over https (Sites/GitHub Pages) or allow mic via lock icon.');
-      }
-    }
-
-    document.getElementById('perm').onclick = async ()=>{
-      // Trigger permission prompt, then populate devices and start monitor
-      try {
-        const s = await navigator.mediaDevices.getUserMedia({ audio: true });
-        s.getTracks().forEach(t => t.stop());
-      } catch(_){}
-      await refreshDevices();
-      await startMicMonitor();
-    };
-    document.getElementById('micSelect').onchange = startMicMonitor;
-
-    // Prime devices (labels appear after first permission grant)
-    if (navigator.mediaDevices?.enumerateDevices) {
-      navigator.mediaDevices.getUserMedia({ audio: true })
-        .then(s => { s.getTracks().forEach(t => t.stop()); })
-        .finally(async ()=>{ await refreshDevices(); });
-    }
-  </script>
+// exports
+document.getElementById('exportTxt').onclick = () => {
+  const lines = [...document.querySelectorAll('.line')].map(div => div.textContent.trim());
+  const blob = new Blob([lines.join('\n')], {type:'text/plain'});
+  const a = document.createElement('a'); a.href = URL.createObjectURL(blob);
+  a.download = 'transcript.txt'; a.click(); URL.revokeObjectURL(a.href);
+};
+document.getElementById('exportJson').onclick = () => {
+  const out = [...document.querySelectorAll('.line')].map(div => {
+    const ts = div.querySelector('.ts')?.textContent?.replace(/\[|\]/g,'') || '00:00';
+    const text = div.textContent.replace(/\[.*?\]\s*/, '').trim();
+    return { ts, text };
+  });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([JSON.stringify({ lines: out }, null, 2)], {type:'application/json'}));
+  a.download = 'transcript.json'; a.click(); URL.revokeObjectURL(a.href);
+};
+</script>
 </body>
 </html>
