@@ -1,0 +1,250 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Live Transcriber - Local (Mic Picker)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    :root { --gap:12px; --border:#e5e7eb; }
+    *{ box-sizing: border-box; }
+    body{ margin:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; }
+    header{ display:flex; gap:var(--gap); align-items:center; padding:var(--gap); border-bottom:1px solid var(--border); flex-wrap:wrap; }
+    header input[type=text]{ flex:1 1 320px; padding:8px 10px; border:1px solid var(--border); border-radius:10px; }
+    header button{ padding:8px 12px; border:1px solid var(--border); background:#111; color:#fff; border-radius:10px; cursor:pointer; }
+    header select{ padding:8px 10px; border:1px solid var(--border); border-radius:10px; background:#fff; }
+    main{ display:grid; grid-template-columns: 1.2fr 1fr; min-height: calc(100vh - 60px); }
+    #player-wrap{ padding:var(--gap); }
+    #player{ width:100%; max-width:960px; aspect-ratio:16/9; background:#000; }
+    #transcript{ padding:var(--gap); border-left:1px solid var(--border); overflow:auto; }
+    .line{ margin:8px 0; }
+    .ts{ cursor:pointer; text-decoration:underline; margin-right:6px; }
+    .meta{ color:#6b7280; font-size:12px; }
+    .status-dot{ display:inline-block; width:10px; height:10px; border-radius:50%; background:#9ca3af; margin-right:6px; vertical-align:middle; }
+    .status-dot.live{ background:#10b981; }
+    .toolbar{ display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+    #vu{ background:#f3f4f6; border-radius:8px; }
+  </style>
+  <script src="https://www.youtube.com/iframe_api"></script>
+</head>
+<body>
+  <header>
+    <input id="ytUrl" type="text" placeholder="Paste YouTube Live URL (optional)" />
+    <button id="load">Load</button>
+
+    <div class="toolbar">
+      <button id="start">Start</button>
+      <button id="stop">Stop</button>
+      <button id="exportTxt">Export .txt</button>
+      <button id="exportJson">Export .json</button>
+    </div>
+
+    <div class="toolbar">
+      <select id="micSelect" title="Pick input for the VU meter"></select>
+      <button id="perm" title="Request mic permission / refresh devices">Mic Permission</button>
+      <canvas id="vu" width="140" height="16" title="Live input level"></canvas>
+    </div>
+
+    <span class="meta">
+      <span id="liveDot" class="status-dot"></span><span id="status">idle</span>
+    </span>
+  </header>
+
+  <main>
+    <section id="player-wrap">
+      <div id="player"></div>
+      <div class="meta" style="padding:8px 0">
+        Tip: For best results, use a loopback input (Windows: “Stereo Mix”/VB-Cable; macOS: BlackHole/Loopback).
+        After you see the VU move, click the lock icon in Chrome → Microphone → select the same device for this page.
+      </div>
+    </section>
+    <aside id="transcript"></aside>
+  </main>
+
+  <script>
+    let player, rec, recognizing=false, startedAt=0, lines=[];
+    let micStream = null, vuRAF = null;
+
+    // ---------- YouTube ----------
+    function onYouTubeIframeAPIReady(){
+      player = new YT.Player('player', {
+        height:'390', width:'640', videoId:'',
+        playerVars:{ autoplay:0, playsinline:1, modestbranding:1 },
+        events:{
+          onReady:(e)=>{
+            // quiet the widget warnings
+            e.target.getIframe()?.setAttribute(
+              'allow',
+              'autoplay; encrypted-media; picture-in-picture; clipboard-write; web-share; accelerometer; gyroscope'
+            );
+          }
+        }
+      });
+    }
+    function parseYouTubeId(url){
+      if (!url) return '';
+      let m = url.match(/[?&]v=([A-Za-z0-9_-]{6,})/); if (m) return m[1];
+      m = url.match(/youtu\.be\/([A-Za-z0-9_-]{6,})/); if (m) return m[1];
+      m = url.match(/youtube\.com\/live\/([A-Za-z0-9_-]{6,})/); if (m) return m[1];
+      m = url.match(/youtube\.com\/embed\/([A-Za-z0-9_-]{6,})/); if (m) return m[1];
+      return '';
+    }
+    document.getElementById('load').onclick = () => {
+      const url = document.getElementById('ytUrl').value.trim();
+      const id = parseYouTubeId(url);
+      if (id) { player.loadVideoById(id); logStatus('video loaded'); }
+      else { logStatus('could not parse video id'); }
+    };
+
+    // ---------- Utils ----------
+    function secToClock(sec){
+      sec = Math.max(0, Math.floor(sec));
+      const h = Math.floor(sec/3600), m = Math.floor((sec%3600)/60), s = sec%60;
+      return (h? String(h).padStart(2,'0')+':' : '') + String(m).padStart(2,'0') + ':' + String(s).padStart(2,'0');
+    }
+    function addLine(text, startSec){
+      const div = document.createElement('div');
+      div.className = 'line';
+      const a = document.createElement('span');
+      a.className = 'ts';
+      a.textContent = '[' + secToClock(startSec) + ']';
+      a.onclick = () => player?.seekTo && player.seekTo(startSec, true);
+      const t = document.createElement('span');
+      t.textContent = ' ' + text;
+      div.appendChild(a); div.appendChild(t);
+      const pane = document.getElementById('transcript');
+      pane.appendChild(div); pane.scrollTop = pane.scrollHeight;
+    }
+    function logStatus(msg, live=false){
+      document.getElementById('status').textContent = msg;
+      document.getElementById('liveDot').classList.toggle('live', !!live);
+      console.log('[status]', msg);
+    }
+
+    // ---------- Web Speech Recognition ----------
+    function getRecognizer(){
+      const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+      if (!SR) { alert('Web Speech API not supported or blocked. Use Chrome over https (Sites/GitHub Pages), then try again.'); return null; }
+      const r = new SR();
+      r.lang = 'en-US';
+      r.interimResults = true;
+      r.continuous = true;
+      return r;
+    }
+
+    document.getElementById('start').onclick = () => {
+      if (recognizing) return;
+      const SR = getRecognizer(); if (!SR) return;
+      rec = SR; lines = []; document.getElementById('transcript').innerHTML = '';
+      startedAt = Date.now(); logStatus('listening…', true);
+
+      rec.onresult = (e) => {
+        let finalChunk='';
+        for (let i=e.resultIndex; i<e.results.length; i++){
+          const res = e.results[i];
+          if (res.isFinal) finalChunk += res[0].transcript.trim() + ' ';
+        }
+        if (finalChunk){
+          const secs = Math.floor((Date.now()-startedAt)/1000);
+          const line = { text: finalChunk.trim(), startSec: Math.max(0, secs-2) };
+          lines.push(line); addLine(line.text, line.startSec);
+        }
+      };
+      rec.onerror = (e) => {
+        console.warn('rec error', e);
+        if (e?.error === 'no-speech') logStatus('no speech detected — check mic input / use https', false);
+      };
+      rec.onend = () => { recognizing=false; logStatus('stopped', false); };
+      try { rec.start(); } catch(_) {}
+      recognizing = true;
+    };
+
+    document.getElementById('stop').onclick = () => {
+      try { rec?.stop(); } catch(_) {}
+    };
+
+    // ---------- Export ----------
+    document.getElementById('exportTxt').onclick = () => {
+      const txt = lines.map(l => '['+secToClock(l.startSec)+'] '+l.text).join('\n');
+      const blob = new Blob([txt], {type:'text/plain'});
+      const a = document.createElement('a'); a.href = URL.createObjectURL(blob);
+      a.download = 'transcript.txt'; a.click(); URL.revokeObjectURL(a.href);
+    };
+    document.getElementById('exportJson').onclick = () => {
+      const blob = new Blob([JSON.stringify({ lines }, null, 2)], {type:'application/json'});
+      const a = document.createElement('a'); a.href = URL.createObjectURL(blob);
+      a.download = 'transcript.json'; a.click(); URL.revokeObjectURL(a.href);
+    };
+
+    // ---------- Mic Picker + VU Meter ----------
+    async function refreshDevices(){
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const mics = devices.filter(d => d.kind === 'audioinput');
+      const sel = document.getElementById('micSelect');
+      sel.innerHTML = '';
+      mics.forEach((d, idx) => {
+        const opt = document.createElement('option');
+        opt.value = d.deviceId;
+        opt.textContent = d.label || `Mic ${idx+1}`;
+        sel.appendChild(opt);
+      });
+    }
+
+    async function startMicMonitor(){
+      try{
+        if (micStream) micStream.getTracks().forEach(t => t.stop());
+        const deviceId = document.getElementById('micSelect').value || undefined;
+        micStream = await navigator.mediaDevices.getUserMedia({
+          audio: deviceId ? { deviceId: { exact: deviceId } } : true
+        });
+
+        const ctx = new (window.AudioContext || window.webkitAudioContext)();
+        const source = ctx.createMediaStreamSource(micStream);
+        const analyser = ctx.createAnalyser();
+        analyser.fftSize = 2048;
+        source.connect(analyser);
+
+        const vu = document.getElementById('vu');
+        const g = vu.getContext('2d');
+        const data = new Uint8Array(analyser.fftSize);
+
+        function draw(){
+          analyser.getByteTimeDomainData(data);
+          let peak = 0;
+          for (let i=0;i<data.length;i++){
+            const v = Math.abs(data[i]-128);
+            if (v>peak) peak=v;
+          }
+          const norm = Math.min(1, peak/64); // rough scale
+          g.clearRect(0,0,vu.width,vu.height);
+          g.fillStyle = '#111';
+          g.fillRect(0,0,vu.width*norm,vu.height);
+          vuRAF = requestAnimationFrame(draw);
+        }
+        if (vuRAF) cancelAnimationFrame(vuRAF);
+        draw();
+        logStatus('mic monitoring', true);
+      }catch(err){
+        alert('Mic access failed: ' + err.message + '\nIf this is a file:// page, Chrome may restrict mic. Host over https (Sites/GitHub Pages) or allow mic via lock icon.');
+      }
+    }
+
+    document.getElementById('perm').onclick = async ()=>{
+      // Trigger permission prompt, then populate devices and start monitor
+      try {
+        const s = await navigator.mediaDevices.getUserMedia({ audio: true });
+        s.getTracks().forEach(t => t.stop());
+      } catch(_){}
+      await refreshDevices();
+      await startMicMonitor();
+    };
+    document.getElementById('micSelect').onchange = startMicMonitor;
+
+    // Prime devices (labels appear after first permission grant)
+    if (navigator.mediaDevices?.enumerateDevices) {
+      navigator.mediaDevices.getUserMedia({ audio: true })
+        .then(s => { s.getTracks().forEach(t => t.stop()); })
+        .finally(async ()=>{ await refreshDevices(); });
+    }
+  </script>
+</body>
+</html>
