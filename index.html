@@ -2,7 +2,7 @@
 <html>
 <head>
   <meta charset="utf-8" />
-  <title>Live Transcriber — Whisper via Cloudflare Worker</title>
+  <title>Live Transcriber — In-Browser Vosk (Free, Offline)</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <style>
     :root { --gap:12px; --border:#e5e7eb; }
@@ -21,8 +21,11 @@
     .status-dot{ display:inline-block; width:10px; height:10px; border-radius:50%; background:#9ca3af; margin-right:6px; vertical-align:middle; }
     .status-dot.live{ background:#10b981; }
     .toolbar{ display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+    .note{ font-size:12px; color:#6b7280; }
   </style>
   <script src="https://www.youtube.com/iframe_api"></script>
+  <!-- Vosk WASM runtime (served from your repo). Keep the relative path! -->
+  <script src="./vosk/vosk.js"></script>
 </head>
 <body>
   <header>
@@ -43,18 +46,22 @@
     <section id="player-wrap">
       <div id="player"></div>
       <div class="meta" style="padding:8px 0">
-        Click <b>Start</b>, choose the tab/window that’s playing the livestream, and check “Share audio”.
+        Click <b>Start</b>, choose the tab/window that’s playing the livestream, and check “Share tab audio”. Runs fully in your browser — no APIs/billing.
       </div>
+      <div class="note" id="modelNote">Model: not loaded</div>
     </section>
     <aside id="transcript"></aside>
   </main>
 
 <script>
-/* ====== POINT TO CLOUDFLARE WORKER ====== */
-const WEBAPP_URL = "https://rapid-thunder-3369.iamhenrykeller.workers.dev";
-/* ======================================== */
+/* ====== VOSK PATHS (relative for GitHub Pages project sites) ====== */
+const VOSK_BASE = "./vosk"; // where vosk.js + vosk.wasm live
+const MODEL_PATH = "models/vosk-model-small-en-us-0.15"; // inside VOSK_BASE
+/* ================================================================ */
 
-let player, startedAt=0, mediaStream=null, recorder=null;
+let player, startedAt=0, mediaStream=null;
+let audioCtx=null, srcNode=null, procNode=null;
+let recognizer=null, model=null, modelLoaded=false;
 
 function onYouTubeIframeAPIReady(){
   player = new YT.Player('player', { height:'390', width:'640', videoId:'', playerVars:{ autoplay:0, playsinline:1, modestbranding:1 }});
@@ -79,6 +86,7 @@ function secToClock(sec){
   return (h? String(h).padStart(2,'0')+':' : '') + String(m).padStart(2,'0') + ':' + String(s).padStart(2,'0');
 }
 function addLine(text, startSec){
+  if (!text) return;
   const div = document.createElement('div'); div.className = 'line';
   const a = document.createElement('span'); a.className = 'ts';
   a.textContent = '[' + secToClock(startSec) + ']';
@@ -93,59 +101,120 @@ function setStatus(msg, live=false){
   document.getElementById('dot').classList.toggle('live', !!live);
   console.log('[status]', msg);
 }
+function setModelNote(msg){
+  document.getElementById('modelNote').textContent = msg;
+}
 
+/* ---------- Downsample to 16 kHz Int16 for Vosk ---------- */
+function downsampleTo16k(float32Array, inSampleRate){
+  const outSampleRate = 16000;
+  if (inSampleRate === outSampleRate) {
+    const out = new Int16Array(float32Array.length);
+    for (let i=0;i<float32Array.length;i++){
+      let s = Math.max(-1, Math.min(1, float32Array[i]));
+      out[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+    }
+    return out;
+  }
+  const ratio = inSampleRate / outSampleRate;
+  const newLen = Math.round(float32Array.length / ratio);
+  const out = new Int16Array(newLen);
+  for (let i=0;i<newLen;i++){
+    const idx = i*ratio;
+    const i0 = Math.floor(idx), i1 = Math.min(i0+1, float32Array.length-1);
+    const frac = idx - i0;
+    const s = float32Array[i0]*(1-frac) + float32Array[i1]*frac;
+    let v = Math.max(-1, Math.min(1, s));
+    out[i] = v < 0 ? v*0x8000 : v*0x7FFF;
+  }
+  return out;
+}
+
+/* ------------------- Load Vosk (WASM + Model) ------------------- */
+async function ensureVoskLoaded(){
+  if (modelLoaded) return true;
+  if (!window.Vosk) { alert("Vosk runtime not found. Make sure ./vosk/vosk.js is served."); return false; }
+
+  setModelNote("Loading Vosk WASM… (first load 5–20s)");
+  Vosk.setModuleBase(VOSK_BASE + "/"); // vosk.wasm sits here
+  model = await Vosk.createModel(VOSK_BASE + "/" + MODEL_PATH);
+  recognizer = new model.KaldiRecognizer(16000); // mono 16k
+  modelLoaded = true;
+  setModelNote("Model loaded ✔ (small EN)");
+  return true;
+}
+
+/* ---------------- Start/Stop ---------------- */
 document.getElementById('start').onclick = async () => {
   try{
-    mediaStream = await navigator.mediaDevices.getDisplayMedia({ audio: true, video: false });
-    const track = mediaStream.getAudioTracks()[0];
-    if (!track) { alert('No audio track captured. Pick the tab with sound and check “Share audio”.'); return; }
+    if (location.protocol !== 'https:' && location.hostname !== 'localhost') {
+      console.warn('Screen/tab capture needs HTTPS. Use GitHub Pages or localhost.');
+    }
 
-    const mime = MediaRecorder.isTypeSupported('audio/webm;codecs=opus') ? 'audio/webm;codecs=opus' : 'audio/webm';
-    recorder = new MediaRecorder(mediaStream, { mimeType: mime, audioBitsPerSecond: 128000 });
+    // Ensure model is loaded
+    const ok = await ensureVoskLoaded();
+    if (!ok) return;
 
-    startedAt = Date.now();
-    setStatus('listening…', true);
+    // Request VIDEO + AUDIO; audio-only often fails
+    const ms = await navigator.mediaDevices.getDisplayMedia({
+      video: true,
+      audio: { echoCancellation:false, noiseSuppression:false, autoGainControl:false }
+    });
+    // Stop video track immediately; we only need audio
+    const vt = ms.getVideoTracks()[0]; if (vt) vt.stop();
+    const at = ms.getAudioTracks()[0];
+    if (!at) { alert('No audio captured. Pick the tab with sound and check “Share tab audio”.'); return; }
+    mediaStream = ms;
 
-    recorder.ondataavailable = async ev => {
-      if (!ev.data || ev.data.size === 0) return;
-      const offsetMs = Date.now() - startedAt;
-      await sendChunk(ev.data, offsetMs);
+    // WebAudio pipeline: MediaStream → ScriptProcessor → downsample → recognizer
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    srcNode = audioCtx.createMediaStreamSource(mediaStream);
+
+    const bufSize = 4096; // tweak 2048..8192 for CPU/latency tradeoff
+    procNode = audioCtx.createScriptProcessor(bufSize, 1, 1);
+    procNode.onaudioprocess = () => {
+      const input = new Float32Array(procNode.bufferSize);
+      // Pull latest buffer
+      const chData = procNode.context.createBuffer(1, procNode.bufferSize, audioCtx.sampleRate);
+      // NOTE: ScriptProcessor gives input via event in some browsers; fallback:
+      // If your browser provides e.inputBuffer in handler, you can use that instead.
     };
 
-    recorder.start(5000);
+    // Proper handler with input buffer:
+    procNode.onaudioprocess = (e) => {
+      const ch0 = e.inputBuffer.getChannelData(0); // Float32 -1..1
+      const pcm16 = downsampleTo16k(ch0, audioCtx.sampleRate);
+      recognizer.acceptWaveform(pcm16);
+      const r = recognizer.result(); // “final-ish” result chunks
+      if (r && r.text) {
+        const secs = Math.floor((Date.now() - startedAt)/1000);
+        addLine(r.text, Math.max(0, secs - 1));
+      } else {
+        // Optional: show partials
+        // const p = recognizer.partialResult();
+        // if (p && p.partial) { /* show lightweight partials if you want */ }
+      }
+    };
+
+    srcNode.connect(procNode);
+    procNode.connect(audioCtx.destination); // keep node alive; audio is effectively silent
+
+    startedAt = Date.now();
+    setStatus('listening (local Vosk)…', true);
   }catch(err){
-    setStatus('error: ' + (err?.message || err), false);
+    setStatus('error: ' + (err?.message || String(err)), false);
   }
 };
 
 document.getElementById('stop').onclick = () => {
-  try { recorder?.stop(); } catch {}
-  try { mediaStream?.getTracks().forEach(t => t.stop()); } catch {}
+  try { procNode && procNode.disconnect(); } catch {}
+  try { srcNode && srcNode.disconnect(); } catch {}
+  try { audioCtx && audioCtx.close(); } catch {}
+  try { mediaStream && mediaStream.getTracks().forEach(t => t.stop()); } catch {}
   setStatus('stopped', false);
 };
 
-async function sendChunk(blob, offsetMs){
-  try{
-    const fd = new FormData();
-    fd.append('audio', blob, 'chunk.webm');
-
-    const r = await fetch(WEBAPP_URL, { method: 'POST', body: fd });
-    const data = await r.json();
-
-    if (data && data.text) {
-      const text = data.text.trim();
-      const secs = Math.floor(offsetMs/1000);
-      addLine(text, Math.max(0, secs - 2));
-    } else if (data?.error) {
-      console.warn('Whisper error', data);
-      setStatus('Whisper error (see console)', false);
-    }
-  } catch (e) {
-    console.error('sendChunk failed', e);
-    setStatus('send failed: ' + e.message, false);
-  }
-}
-
+/* ----------------- Exports ----------------- */
 document.getElementById('exportTxt').onclick = () => {
   const lines = [...document.querySelectorAll('.line')].map(div => div.textContent.trim());
   const blob = new Blob([lines.join('\n')], {type:'text/plain'});
