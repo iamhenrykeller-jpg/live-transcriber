@@ -2,7 +2,7 @@
 <html>
 <head>
   <meta charset="utf-8" />
-  <title>Live Transcriber — Whisper via Apps Script</title>
+  <title>Live Transcriber — Whisper via Cloudflare Worker</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <style>
     :root { --gap:12px; --border:#e5e7eb; }
@@ -43,16 +43,16 @@
     <section id="player-wrap">
       <div id="player"></div>
       <div class="meta" style="padding:8px 0">
-        Click <b>Start</b>, choose the tab/window that’s playing the livestream, and check “Share audio”. No drivers or sound settings needed.
+        Click <b>Start</b>, choose the tab/window that’s playing the livestream, and check “Share audio”.
       </div>
     </section>
     <aside id="transcript"></aside>
   </main>
 
 <script>
-/* ====== SET THIS TO YOUR APPS SCRIPT WEB APP URL (ends with /exec) ====== */
-const WEBAPP_URL = "https://script.google.com/macros/s/AKfycbyVkPPNNJSIMbVsTwZRGXt2m4KvRYMfjzO1Q1Z4gOmJKP4GFJOYeogv4C27q37GcsyfSg/exec";
-/* ======================================================================= */
+/* ====== POINT TO CLOUDFLARE WORKER ====== */
+const WEBAPP_URL = "https://rapid-thunder-3369.iamhenrykeller.workers.dev";
+/* ======================================== */
 
 let player, startedAt=0, mediaStream=null, recorder=null;
 
@@ -94,46 +94,14 @@ function setStatus(msg, live=false){
   console.log('[status]', msg);
 }
 
-// --- patched Start/Stop handlers (video+audio capture) ---
 document.getElementById('start').onclick = async () => {
   try{
-    if (location.protocol !== 'https:' && location.hostname !== 'localhost') {
-      console.warn('getDisplayMedia usually requires HTTPS. Use GitHub Pages or localhost.');
-    }
+    mediaStream = await navigator.mediaDevices.getDisplayMedia({ audio: true, video: false });
+    const track = mediaStream.getAudioTracks()[0];
+    if (!track) { alert('No audio track captured. Pick the tab with sound and check “Share audio”.'); return; }
 
-    // Ask for VIDEO + AUDIO; audio-only often throws NotSupportedError
-    const constraints = {
-      video: true,
-      audio: {
-        echoCancellation: false,
-        noiseSuppression: false,
-        autoGainControl: false
-      }
-    };
-    mediaStream = await navigator.mediaDevices.getDisplayMedia(constraints);
-
-    // Immediately stop the video track; we only need audio
-    const vtrack = mediaStream.getVideoTracks()[0];
-    if (vtrack) vtrack.stop();
-
-    const atrack = mediaStream.getAudioTracks()[0];
-    if (!atrack) {
-      alert('No audio track captured. Pick the tab with sound and check “Share tab audio”.');
-      return;
-    }
-
-    // Recorder with robust mime fallback
-    let mime = '';
-    if (MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) {
-      mime = 'audio/webm;codecs=opus';
-    } else if (MediaRecorder.isTypeSupported('audio/webm')) {
-      mime = 'audio/webm';
-    } else if (MediaRecorder.isTypeSupported('audio/ogg;codecs=opus')) {
-      mime = 'audio/ogg;codecs=opus';
-    } // else let browser choose
-
-    recorder = mime ? new MediaRecorder(mediaStream, { mimeType: mime, audioBitsPerSecond: 128000 })
-                    : new MediaRecorder(mediaStream);
+    const mime = MediaRecorder.isTypeSupported('audio/webm;codecs=opus') ? 'audio/webm;codecs=opus' : 'audio/webm';
+    recorder = new MediaRecorder(mediaStream, { mimeType: mime, audioBitsPerSecond: 128000 });
 
     startedAt = Date.now();
     setStatus('listening…', true);
@@ -141,12 +109,12 @@ document.getElementById('start').onclick = async () => {
     recorder.ondataavailable = async ev => {
       if (!ev.data || ev.data.size === 0) return;
       const offsetMs = Date.now() - startedAt;
-      await sendChunk(ev.data, offsetMs); // base64 JSON upload
+      await sendChunk(ev.data, offsetMs);
     };
 
-    recorder.start(5000); // 5s chunks
+    recorder.start(5000);
   }catch(err){
-    setStatus('error: ' + (err?.message || String(err)), false);
+    setStatus('error: ' + (err?.message || err), false);
   }
 };
 
@@ -156,36 +124,15 @@ document.getElementById('stop').onclick = () => {
   setStatus('stopped', false);
 };
 
-// ---- base64 JSON upload (Apps Script-friendly) ----
-async function blobToBase64(blob) {
-  const buf = await blob.arrayBuffer();
-  let binary = '';
-  const bytes = new Uint8Array(buf);
-  const chunkSize = 0x8000;
-  for (let i = 0; i < bytes.length; i += chunkSize) {
-    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
-  }
-  return btoa(binary);
-}
-
 async function sendChunk(blob, offsetMs){
   try{
-    const audioBase64 = await blobToBase64(blob);
-    const payload = {
-      audioBase64,
-      mime: blob.type || 'audio/webm'
-      // offsetMs // optional
-    };
+    const fd = new FormData();
+    fd.append('audio', blob, 'chunk.webm');
 
-    const r = await fetch(WEBAPP_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload)
-    });
-
+    const r = await fetch(WEBAPP_URL, { method: 'POST', body: fd });
     const data = await r.json();
 
-    if (data && data.ok && data.text) {
+    if (data && data.text) {
       const text = data.text.trim();
       const secs = Math.floor(offsetMs/1000);
       addLine(text, Math.max(0, secs - 2));
@@ -195,11 +142,10 @@ async function sendChunk(blob, offsetMs){
     }
   } catch (e) {
     console.error('sendChunk failed', e);
-    setStatus('send failed: ' + (e?.message || String(e)), false);
+    setStatus('send failed: ' + e.message, false);
   }
 }
 
-// exports
 document.getElementById('exportTxt').onclick = () => {
   const lines = [...document.querySelectorAll('.line')].map(div => div.textContent.trim());
   const blob = new Blob([lines.join('\n')], {type:'text/plain'});
