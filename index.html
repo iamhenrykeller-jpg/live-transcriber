@@ -24,7 +24,7 @@
     .note{ font-size:12px; color:#6b7280; }
   </style>
 
-  <!-- YouTube player -->
+  <!-- YouTube player API -->
   <script src="https://www.youtube.com/iframe_api"></script>
 
   <!-- Vosk runtime -->
@@ -61,30 +61,57 @@
 const MODEL_URL = "https://github.com/iamhenrykeller-jpg/live-transcriber/releases/download/vosk/vosk-model-small-en-us-0.15.tar.gz";
 /* ========================================== */
 
-let player, startedAt=0, mediaStream=null;
+let player, playerReady = false;
+let startedAt=0, mediaStream=null;
 let audioCtx=null, srcNode=null, procNode=null;
 let recognizer=null, modelLoaded=false;
 
+/* ---------- YouTube loader (robust) ---------- */
 function onYouTubeIframeAPIReady(){
   player = new YT.Player('player', {
     height:'390', width:'640', videoId:'',
-    playerVars:{ autoplay:0, playsinline:1, modestbranding:1 }
+    playerVars:{ autoplay:0, playsinline:1, modestbranding:1 },
+    events:{ onReady: () => { playerReady = true; console.log('[yt] ready'); } }
   });
 }
+
 function parseYouTubeId(url){
-  if (!url) return '';
-  let m = url.match(/[?&]v=([A-Za-z0-9_-]{6,})/); if (m) return m[1];
-  m = url.match(/youtu\.be\/([A-Za-z0-9_-]{6,})/); if (m) return m[1];
-  m = url.match(/youtube\.com\/live\/([A-Za-z0-9_-]{6,})/); if (m) return m[1];
-  m = url.match(/youtube\.com\/embed\/([A-Za-z0-9_-]{6,})/); if (m) return m[1];
-  return '';
+  try{
+    const u = new URL(url);
+    const v = u.searchParams.get('v');
+    if (v && /^[A-Za-z0-9_-]{6,}$/.test(v)) return v;
+    const m1 = u.hostname.includes('youtu.be') ? u.pathname.slice(1) : '';
+    if (m1 && /^[A-Za-z0-9_-]{6,}$/.test(m1)) return m1;
+    const m2 = u.pathname.match(/\/live\/([A-Za-z0-9_-]{6,})/);
+    if (m2) return m2[1];
+    const m3 = u.pathname.match(/\/embed\/([A-Za-z0-9_-]{6,})/);
+    if (m3) return m3[1];
+    return '';
+  }catch{
+    const bare = (url || '').trim();
+    return /^[A-Za-z0-9_-]{6,}$/.test(bare) ? bare : '';
+  }
 }
+
 document.getElementById('load').onclick = () => {
   const url = document.getElementById('ytUrl').value.trim();
+  if (!player || !playerReady) { console.warn('[yt] player not ready yet'); return; }
   const id = parseYouTubeId(url);
-  if (id) player.loadVideoById(id);
+  if (id) {
+    console.log('[yt] loading by id', id);
+    player.loadVideoById(id);
+  } else {
+    try {
+      console.log('[yt] loading by url', url);
+      player.loadVideoByUrl(url);
+    } catch (e) {
+      console.warn('[yt] loadVideoByUrl failed', e);
+      alert('Could not load that URL. Try a direct watch URL like https://www.youtube.com/watch?v=VIDEO_ID');
+    }
+  }
 };
 
+/* ---------- UI helpers ---------- */
 function secToClock(sec){
   sec = Math.max(0, Math.floor(sec));
   const h = Math.floor(sec/3600), m = Math.floor((sec%3600)/60), s = sec%60;
@@ -186,9 +213,9 @@ document.getElementById('start').onclick = async () => {
         const secs = Math.floor((Date.now() - startedAt)/1000);
         addLine(r.text, Math.max(0, secs - 1));
       }
-      // Optional partials:
+      // Optional: show partials
       // const p = recognizer.partialResult();
-      // if (p && p.partial) { /* show live partials */ }
+      // if (p && p.partial) { /* update a temporary line */ }
     };
 
     srcNode.connect(procNode);
