@@ -36,6 +36,7 @@
     <button id="load">Load</button>
 
     <div class="toolbar">
+      <button id="play">Play ▶</button>
       <button id="start">Start (pick tab/window)</button>
       <button id="stop">Stop</button>
       <button id="exportTxt">Export .txt</button>
@@ -49,7 +50,7 @@
     <section id="player-wrap">
       <div id="player"></div>
       <div class="meta" style="padding:8px 0">
-        Click <b>Start</b>, choose the tab/window that’s playing the livestream, and check <b>“Share tab audio”</b>.
+        Click <b>Load</b> to set the video, then <b>Play</b> once (user gesture helps), then <b>Start</b> and share the tab with audio.
       </div>
       <div class="note" id="modelNote">Model: not loaded</div>
     </section>
@@ -66,12 +67,33 @@ let startedAt=0, mediaStream=null;
 let audioCtx=null, srcNode=null, procNode=null;
 let recognizer=null, modelLoaded=false;
 
-/* ---------- YouTube loader (robust) ---------- */
+/* ---------- YouTube loader with logs + origin + onError ---------- */
 function onYouTubeIframeAPIReady(){
   player = new YT.Player('player', {
     height:'390', width:'640', videoId:'',
-    playerVars:{ autoplay:0, playsinline:1, modestbranding:1 },
-    events:{ onReady: () => { playerReady = true; console.log('[yt] ready'); } }
+    playerVars:{
+      autoplay:0, playsinline:1, modestbranding:1,
+      origin: location.origin   // important for some embed contexts
+    },
+    events:{
+      onReady: () => { playerReady = true; console.log('[yt] ready'); setStatus('YouTube player ready'); },
+      onError: (e) => {
+        const code = e?.data;
+        const msg = {
+          2:  'Invalid parameter. (Bad video ID/URL)',
+          5:  'HTML5 player error.',
+          100:'Video not found or removed.',
+          101:'Embedding disabled by owner.',
+          150:'Embedding disabled by owner.'
+        }[code] || ('Unknown error code: ' + code);
+        console.warn('[yt error]', code, msg);
+        setStatus('YouTube error: ' + msg);
+        alert('YouTube error: ' + msg);
+      },
+      onStateChange: (e) => {
+        console.log('[yt state]', e.data); // 1 playing, 2 paused, 3 buffering, etc.
+      }
+    }
   });
 }
 
@@ -95,19 +117,33 @@ function parseYouTubeId(url){
 
 document.getElementById('load').onclick = () => {
   const url = document.getElementById('ytUrl').value.trim();
-  if (!player || !playerReady) { console.warn('[yt] player not ready yet'); return; }
+  if (!player || !playerReady) { console.warn('[yt] player not ready yet'); setStatus('Player not ready yet'); return; }
+
   const id = parseYouTubeId(url);
   if (id) {
-    console.log('[yt] loading by id', id);
-    player.loadVideoById(id);
+    console.log('[yt] cue by id', id);
+    player.cueVideoById(id);
+    setStatus('Video cued by ID: ' + id);
   } else {
     try {
-      console.log('[yt] loading by url', url);
-      player.loadVideoByUrl(url);
+      console.log('[yt] cue by url', url);
+      player.cueVideoByUrl(url);
+      setStatus('Video cued by URL');
     } catch (e) {
-      console.warn('[yt] loadVideoByUrl failed', e);
+      console.warn('[yt] cueVideoByUrl failed', e);
+      setStatus('Could not load that URL');
       alert('Could not load that URL. Try a direct watch URL like https://www.youtube.com/watch?v=VIDEO_ID');
     }
+  }
+};
+
+// explicit play button to satisfy user gesture policies
+document.getElementById('play').onclick = () => {
+  try{
+    player?.playVideo?.();
+    setStatus('Play requested');
+  }catch(e){
+    console.warn('play failed', e);
   }
 };
 
@@ -213,7 +249,7 @@ document.getElementById('start').onclick = async () => {
         const secs = Math.floor((Date.now() - startedAt)/1000);
         addLine(r.text, Math.max(0, secs - 1));
       }
-      // Optional: show partials
+      // Optional partials:
       // const p = recognizer.partialResult();
       // if (p && p.partial) { /* update a temporary line */ }
     };
