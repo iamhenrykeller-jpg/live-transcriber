@@ -28,7 +28,7 @@
   <!-- YouTube player API -->
   <script src="https://www.youtube.com/iframe_api"></script>
 
-  <!-- Vosk runtime -->
+  <!-- Vosk runtime (CDN). If you later host vosk.js yourself, swap this to ./vosk/vosk.js -->
   <script src="https://unpkg.com/vosk-browser@0.0.8/dist/vosk.js"></script>
 </head>
 <body>
@@ -51,7 +51,7 @@
     <section id="player-wrap">
       <div id="player"></div>
       <div class="meta" style="padding:8px 0">
-        1) <b>Load</b> your URL (button enables when player is ready) → 2) <b>Play ▶</b> → 3) <b>Start</b> and share the tab with audio.
+        1) <b>LOAD</b> your URL (button enables when player is ready) → 2) <b>Play ▶</b> → 3) <b>Start</b> and share the tab with audio.
       </div>
       <div class="note" id="modelNote">Model: not loaded</div>
     </section>
@@ -68,43 +68,65 @@ let startedAt=0, mediaStream=null;
 let audioCtx=null, srcNode=null, procNode=null;
 let recognizer=null, modelLoaded=false;
 
-/* ---------- YouTube loader with ready-gating & logs ---------- */
-function onYouTubeIframeAPIReady(){
-  player = new YT.Player('player', {
-    height:'390', width:'640', videoId:'',
-    playerVars:{
-      autoplay:0, playsinline:1, modestbranding:1,
-      origin: location.origin   // helps in some embed contexts
-    },
-    events:{
-      onReady: () => {
-        playerReady = true;
-        console.log('[yt] ready');
-        setStatus('YouTube player ready');
-        // enable Load button
-        document.getElementById('load').disabled = false;
-        // auto-cue if URL already typed
-        const v = document.getElementById('ytUrl').value.trim();
-        if (v) doCue(v);
+/* ---------- YouTube loader: robust ready handling ---------- */
+// YouTube calls THIS exact global when iframe_api is ready:
+window.onYouTubeIframeAPIReady = function(){
+  console.log('[yt] iframe API ready callback');
+  createPlayer();
+};
+
+// Fallback: poll until YT.Player is available in case callback didn’t fire
+const ytPoll = setInterval(() => {
+  if (window.YT && YT.Player && !player) {
+    console.log('[yt] YT.Player detected via poll');
+    createPlayer();
+    clearInterval(ytPoll);
+  }
+}, 3000);
+
+function createPlayer(){
+  // Avoid duplicates
+  if (player) return;
+
+  try{
+    player = new YT.Player('player', {
+      height:'390', width:'640', videoId:'',
+      playerVars:{
+        autoplay:0, playsinline:1, modestbranding:1
+        // omit origin to avoid issues on file:// or unusual hosts
       },
-      onError: (e) => {
-        const code = e?.data;
-        const msg = {
-          2:'Invalid parameter (bad video ID/URL)',
-          5:'HTML5 player error',
-          100:'Video not found or removed',
-          101:'Embedding disabled by owner',
-          150:'Embedding disabled by owner'
-        }[code] || ('Unknown error '+code);
-        console.warn('[yt error]', code, msg);
-        setStatus('YouTube error: ' + msg);
-        alert('YouTube error: ' + msg);
-      },
-      onStateChange: (e) => {
-        console.log('[yt state]', e.data); // 1 playing, 2 paused, 3 buffering, etc.
+      events:{
+        onReady: () => {
+          playerReady = true;
+          console.log('[yt] ready');
+          setStatus('YouTube player ready');
+          document.getElementById('load').disabled = false;
+
+          const v = document.getElementById('ytUrl').value.trim();
+          if (v) doCue(v);
+        },
+        onError: (e) => {
+          const code = e?.data;
+          const msg = {
+            2:'Invalid parameter (bad video ID/URL)',
+            5:'HTML5 player error',
+            100:'Video not found or removed',
+            101:'Embedding disabled by owner',
+            150:'Embedding disabled by owner'
+          }[code] || ('Unknown error '+code);
+          console.warn('[yt error]', code, msg);
+          setStatus('YouTube error: ' + msg);
+          alert('YouTube error: ' + msg);
+        },
+        onStateChange: (e) => {
+          console.log('[yt state]', e.data); // 1 playing, 2 paused, 3 buffering, etc.
+        }
       }
-    }
-  });
+    });
+  }catch(err){
+    console.warn('[yt] createPlayer failed', err);
+    setStatus('Failed to init YouTube player');
+  }
 }
 
 function parseYouTubeId(url){
@@ -205,20 +227,36 @@ function downsampleTo16k(float32Array, inSampleRate){
   return out;
 }
 
-/* --------- Load Vosk model from your release --------- */
+/* --------- Vosk model loader (with clear status) --------- */
 async function ensureVoskLoaded(){
   if (modelLoaded) return true;
-  if (!window.Vosk) { alert("Vosk runtime not found."); return false; }
 
-  setModelNote("Loading Vosk (first time can take 5–20s)...");
-  if (Vosk.setLogLevel) Vosk.setLogLevel(0);
+  // Wait for Vosk runtime to appear (in case CDN is slow)
+  let tries = 0;
+  while (!window.Vosk && tries < 40) { // ~4s
+    await new Promise(r => setTimeout(r, 100));
+    tries++;
+  }
+  if (!window.Vosk) {
+    setModelNote("Vosk runtime failed to load (check network/CDN).");
+    alert("Vosk runtime not found. If a network blocker is on, try whitelisting unpkg.com or host vosk.js locally.");
+    return false;
+  }
 
-  const model = await Vosk.createModel(MODEL_URL);
-  recognizer = new model.KaldiRecognizer(16000); // mono 16k
-  modelLoaded = true;
-
-  setModelNote("Model loaded ✔ (small EN)");
-  return true;
+  try{
+    setModelNote("Loading Vosk (first time can take 5–20s)...");
+    if (Vosk.setLogLevel) Vosk.setLogLevel(0);
+    const model = await Vosk.createModel(MODEL_URL);
+    recognizer = new model.KaldiRecognizer(16000); // mono 16k
+    modelLoaded = true;
+    setModelNote("Model loaded ✔ (small EN)");
+    return true;
+  }catch(e){
+    console.warn('Vosk model load failed', e);
+    setModelNote("Model load failed (see console).");
+    alert("Model load failed. If this is a CORS or network issue, try opening the model URL directly in a new tab, or host it on a different static host.");
+    return false;
+  }
 }
 
 /* ---------------- Start / Stop ---------------- */
